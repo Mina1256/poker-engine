@@ -4,8 +4,8 @@ import random
 from dataclasses import dataclass
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from holdem_engine import (
@@ -23,18 +23,34 @@ from holdem_engine import (
 
 app = FastAPI()
 
-# Let any website call this API.
-# Note: allow_credentials=False is correct when using allow_origins=["*"].
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Force CORS headers on every response.
+# This is intentionally permissive for testing/demo.
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "*",
+}
 
 
-# For debugging/demo: bot cards are visible.
+@app.middleware("http")
+async def force_cors(request: Request, call_next):
+    if request.method == "OPTIONS":
+        return Response(status_code=204, headers=CORS_HEADERS)
+
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        response = JSONResponse(
+            status_code=500,
+            content={"detail": str(e)},
+        )
+
+    for key, value in CORS_HEADERS.items():
+        response.headers[key] = value
+
+    return response
+
+
 SHOW_BOT_CARDS = True
 
 
@@ -80,7 +96,7 @@ class ApiPlayer:
 @dataclass
 class ApiHoldemGame:
     seed: int | None = None
-    bot_simulations: int = 2000
+    bot_simulations: int = 300
 
     def __post_init__(self):
         self.rng = random.Random(self.seed)
@@ -420,7 +436,7 @@ class ApiHoldemGame:
 
     @classmethod
     def from_dict(cls, data):
-        game = cls(seed=None, bot_simulations=data.get("bot_simulations", 2000))
+        game = cls(seed=None, bot_simulations=data.get("bot_simulations", 300))
 
         game.hero.stack = data["hero"]["stack"]
         game.hero.hole_cards = strings_to_cards(data["hero"]["hole_cards"])
@@ -440,7 +456,7 @@ class ApiHoldemGame:
         game.game_over = data["game_over"]
         game.winner = data["winner"]
         game.log = data["log"]
-        game.bot_simulations = data.get("bot_simulations", 2000)
+        game.bot_simulations = data.get("bot_simulations", 300)
 
         return game
 
@@ -458,13 +474,20 @@ def root():
 def create_game():
     game = ApiHoldemGame(
         seed=random.randint(0, 10**9),
-        bot_simulations=2000,
+        bot_simulations=300,
     )
 
     return {
         "game_state": game.to_dict(),
         "state": game.get_public_state(),
     }
+
+
+# Optional browser test endpoint.
+# Lets you visit /games in the browser and see a game.
+@app.get("/games")
+def create_game_from_browser():
+    return create_game()
 
 
 @app.post("/action")
