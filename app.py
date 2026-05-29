@@ -1,18 +1,15 @@
 from __future__ import annotations
 
-import json
-import os
 import random
 from dataclasses import dataclass
+from typing import Any
 
-from cryptography.fernet import Fernet, InvalidToken
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from holdem_engine import (
     Deck,
-    Player,
     parse_card,
     best_hand_rank,
     rank_name,
@@ -26,37 +23,19 @@ from holdem_engine import (
 
 app = FastAPI()
 
+# Let any website call this API.
+# Note: allow_credentials=False is correct when using allow_origins=["*"].
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "https://your-frontend-domain.vercel.app",
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# For debugging, set True to reveal bot cards.
-# For a real poker UI, set this to False.
+# For debugging/demo: bot cards are visible.
 SHOW_BOT_CARDS = True
-
-
-# ============================================================
-# Encryption setup
-# ============================================================
-
-FERNET_KEY = os.environ.get("FERNET_KEY")
-
-if FERNET_KEY is None:
-    # Local development fallback.
-    # In production/Vercel, set FERNET_KEY as an environment variable.
-    FERNET_KEY = Fernet.generate_key().decode()
-    print("WARNING: No FERNET_KEY found. Generated temporary local key.")
-
-fernet = Fernet(FERNET_KEY.encode())
 
 
 # ============================================================
@@ -64,13 +43,13 @@ fernet = Fernet(FERNET_KEY.encode())
 # ============================================================
 
 class ActionRequest(BaseModel):
-    state_token: str
+    game_state: dict[str, Any]
     action: str
     amount: int | None = None
 
 
 # ============================================================
-# Card serialization helpers
+# Helpers
 # ============================================================
 
 def cards_to_strings(cards):
@@ -79,6 +58,19 @@ def cards_to_strings(cards):
 
 def strings_to_cards(cards):
     return [parse_card(card) for card in cards]
+
+
+@dataclass
+class ApiPlayer:
+    name: str
+    stack: int = 1000
+    hole_cards: list | None = None
+    folded: bool = False
+    current_bet: int = 0
+
+    def __post_init__(self):
+        if self.hole_cards is None:
+            self.hole_cards = []
 
 
 # ============================================================
@@ -93,8 +85,8 @@ class ApiHoldemGame:
     def __post_init__(self):
         self.rng = random.Random(self.seed)
 
-        self.hero = Player(name="Hero", is_human=True, stack=1000)
-        self.bot = Player(name="Bot", is_human=False, stack=1000)
+        self.hero = ApiPlayer(name="Hero", stack=1000)
+        self.bot = ApiPlayer(name="Bot", stack=1000)
         self.players = [self.hero, self.bot]
 
         self.deck: Deck | None = None
@@ -135,7 +127,7 @@ class ApiHoldemGame:
     # Public state returned to frontend
     # --------------------------------------------------------
 
-    def get_state(self):
+    def get_public_state(self):
         call_amount = max(0, self.current_bet - self.hero.current_bet)
 
         return {
@@ -192,7 +184,7 @@ class ApiHoldemGame:
         if self.check_fold_win():
             return
 
-        # If user calls, the betting round is complete.
+        # If user calls, betting round is complete.
         if action == "call":
             self.end_betting_round()
             return
@@ -208,10 +200,10 @@ class ApiHoldemGame:
             self.end_betting_round()
 
     # --------------------------------------------------------
-    # Process individual action
+    # Process action
     # --------------------------------------------------------
 
-    def process_action(self, player: Player, action: str, amount: int | None):
+    def process_action(self, player: ApiPlayer, action: str, amount: int | None):
         call_amount = max(0, self.current_bet - player.current_bet)
 
         if action == "fold":
@@ -237,6 +229,7 @@ class ApiHoldemGame:
                 raise ValueError("There is already a bet. Use raise.")
             if amount is None or amount <= 0:
                 raise ValueError("Bet amount must be positive.")
+
             self.collect_bet(player, amount)
             self.current_bet = player.current_bet
             self.log.append(f"{player.name} bets {amount}.")
@@ -246,7 +239,7 @@ class ApiHoldemGame:
             if amount is None:
                 raise ValueError("Raise needs an amount.")
 
-            # Here amount means total round bet, not extra amount.
+            # amount means total round bet, not extra amount.
             if amount <= self.current_bet:
                 raise ValueError("Raise amount must be greater than current bet.")
 
@@ -258,7 +251,7 @@ class ApiHoldemGame:
 
         raise ValueError(f"Unknown action: {action}")
 
-    def collect_bet(self, player: Player, amount: int):
+    def collect_bet(self, player: ApiPlayer, amount: int):
         if amount <= 0:
             raise ValueError("Bet amount must be positive.")
 
@@ -397,7 +390,7 @@ class ApiHoldemGame:
         self.stage = "showdown"
 
     # --------------------------------------------------------
-    # Serialization for encrypted state token
+    # Raw state serialization
     # --------------------------------------------------------
 
     def to_dict(self):
@@ -447,28 +440,9 @@ class ApiHoldemGame:
         game.game_over = data["game_over"]
         game.winner = data["winner"]
         game.log = data["log"]
+        game.bot_simulations = data.get("bot_simulations", 2000)
 
         return game
-
-
-# ============================================================
-# Token helpers
-# ============================================================
-
-def encode_game(game: ApiHoldemGame) -> str:
-    raw = json.dumps(game.to_dict()).encode()
-    return fernet.encrypt(raw).decode()
-
-
-def decode_game(token: str) -> ApiHoldemGame:
-    try:
-        raw = fernet.decrypt(token.encode())
-        data = json.loads(raw.decode())
-        return ApiHoldemGame.from_dict(data)
-    except InvalidToken:
-        raise HTTPException(status_code=400, detail="Invalid game token.")
-    except Exception:
-        raise HTTPException(status_code=400, detail="Could not decode game state.")
 
 
 # ============================================================
@@ -488,21 +462,24 @@ def create_game():
     )
 
     return {
-        "state_token": encode_game(game),
-        "state": game.get_state(),
+        "game_state": game.to_dict(),
+        "state": game.get_public_state(),
     }
 
 
 @app.post("/action")
 def submit_action(request: ActionRequest):
-    game = decode_game(request.state_token)
-
     try:
+        game = ApiHoldemGame.from_dict(request.game_state)
         game.apply_user_action(request.action, request.amount)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail=f"Missing game state field: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid game state: {e}")
 
     return {
-        "state_token": encode_game(game),
-        "state": game.get_state(),
+        "game_state": game.to_dict(),
+        "state": game.get_public_state(),
     }
