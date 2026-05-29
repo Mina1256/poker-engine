@@ -1,43 +1,89 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from uuid import uuid4
+import json
+import os
 import random
+from dataclasses import dataclass
 
+from cryptography.fernet import Fernet, InvalidToken
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from holdem_engine import (
     Deck,
     Player,
+    parse_card,
     best_hand_rank,
     rank_name,
     estimate_equity,
 )
 
 
+# ============================================================
+# App setup
+# ============================================================
+
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "https://your-frontend-domain.vercel.app",
+    ],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-GAMES = {}
 
+# For debugging, set True to reveal bot cards.
+# For a real poker UI, set this to False.
+SHOW_BOT_CARDS = True
+
+
+# ============================================================
+# Encryption setup
+# ============================================================
+
+FERNET_KEY = os.environ.get("FERNET_KEY")
+
+if FERNET_KEY is None:
+    # Local development fallback.
+    # In production/Vercel, set FERNET_KEY as an environment variable.
+    FERNET_KEY = Fernet.generate_key().decode()
+    print("WARNING: No FERNET_KEY found. Generated temporary local key.")
+
+fernet = Fernet(FERNET_KEY.encode())
+
+
+# ============================================================
+# Request models
+# ============================================================
 
 class ActionRequest(BaseModel):
+    state_token: str
     action: str
     amount: int | None = None
 
 
+# ============================================================
+# Card serialization helpers
+# ============================================================
+
 def cards_to_strings(cards):
     return [str(card) for card in cards]
 
+
+def strings_to_cards(cards):
+    return [parse_card(card) for card in cards]
+
+
+# ============================================================
+# Stateless poker game
+# ============================================================
 
 @dataclass
 class ApiHoldemGame:
@@ -51,7 +97,7 @@ class ApiHoldemGame:
         self.bot = Player(name="Bot", is_human=False, stack=1000)
         self.players = [self.hero, self.bot]
 
-        self.deck = None
+        self.deck: Deck | None = None
         self.board = []
         self.pot = 0
         self.stage = "preflop"
@@ -85,10 +131,14 @@ class ApiHoldemGame:
 
         self.log.append("New hand started.")
 
+    # --------------------------------------------------------
+    # Public state returned to frontend
+    # --------------------------------------------------------
+
     def get_state(self):
         call_amount = max(0, self.current_bet - self.hero.current_bet)
 
-        state = {
+        return {
             "stage": self.stage,
             "pot": self.pot,
             "board": cards_to_strings(self.board),
@@ -99,7 +149,9 @@ class ApiHoldemGame:
                 "folded": self.hero.folded,
             },
             "bot": {
-                "cards": cards_to_strings(self.bot.hole_cards),
+                "cards": cards_to_strings(self.bot.hole_cards)
+                if SHOW_BOT_CARDS or self.game_over
+                else ["??", "??"],
                 "stack": self.bot.stack,
                 "current_bet": self.bot.current_bet,
                 "folded": self.bot.folded,
@@ -108,10 +160,8 @@ class ApiHoldemGame:
             "legal_actions": self.legal_actions(),
             "game_over": self.game_over,
             "winner": self.winner,
-            "log": self.log[-12:],
+            "log": self.log[-20:],
         }
-
-        return state
 
     def legal_actions(self):
         if self.game_over:
@@ -123,6 +173,10 @@ class ApiHoldemGame:
             return ["check", "bet", "fold"]
 
         return ["call", "raise", "fold"]
+
+    # --------------------------------------------------------
+    # Apply user action
+    # --------------------------------------------------------
 
     def apply_user_action(self, action: str, amount: int | None = None):
         if self.game_over:
@@ -138,20 +192,24 @@ class ApiHoldemGame:
         if self.check_fold_win():
             return
 
-        # If user called a bot bet/raise, betting round is complete.
+        # If user calls, the betting round is complete.
         if action == "call":
             self.end_betting_round()
             return
 
-        # If user checked, bet, or raised, bot gets to respond.
+        # Bot responds to user check/bet/raise.
         self.bot_respond()
 
         if self.check_fold_win():
             return
 
-        # If both players have matched bets, round is done.
+        # If bets are matched, move to next street.
         if self.hero.current_bet == self.bot.current_bet:
             self.end_betting_round()
+
+    # --------------------------------------------------------
+    # Process individual action
+    # --------------------------------------------------------
 
     def process_action(self, player: Player, action: str, amount: int | None):
         call_amount = max(0, self.current_bet - player.current_bet)
@@ -188,7 +246,7 @@ class ApiHoldemGame:
             if amount is None:
                 raise ValueError("Raise needs an amount.")
 
-            # amount means total round bet, not extra amount
+            # Here amount means total round bet, not extra amount.
             if amount <= self.current_bet:
                 raise ValueError("Raise amount must be greater than current bet.")
 
@@ -211,6 +269,10 @@ class ApiHoldemGame:
         player.current_bet += amount
         self.pot += amount
 
+    # --------------------------------------------------------
+    # Bot logic
+    # --------------------------------------------------------
+
     def bot_respond(self):
         call_amount = max(0, self.current_bet - self.bot.current_bet)
         action, amount = self.get_monte_carlo_bot_action(call_amount)
@@ -222,7 +284,7 @@ class ApiHoldemGame:
             board=self.board,
             num_opponents=1,
             simulations=self.bot_simulations,
-            seed=self.rng.randint(0, 10**9),
+            seed=random.randint(0, 10**9),
         )
 
         equity = result["equity"]
@@ -238,7 +300,7 @@ class ApiHoldemGame:
 
             return "check", None
 
-        # Facing a bet.
+        # Bot is facing a bet.
         if call_amount > self.bot.stack:
             return "fold", None
 
@@ -258,6 +320,10 @@ class ApiHoldemGame:
 
         return "fold", None
 
+    # --------------------------------------------------------
+    # Round progression
+    # --------------------------------------------------------
+
     def check_fold_win(self):
         active = [p for p in self.players if not p.folded]
 
@@ -268,7 +334,10 @@ class ApiHoldemGame:
             self.winner = winner.name
             self.game_over = True
 
-            self.log.append(f"{winner.name} wins {self.pot} because the other player folded.")
+            self.log.append(
+                f"{winner.name} wins {self.pot} because the other player folded."
+            )
+
             self.pot = 0
             return True
 
@@ -327,44 +396,113 @@ class ApiHoldemGame:
         self.game_over = True
         self.stage = "showdown"
 
+    # --------------------------------------------------------
+    # Serialization for encrypted state token
+    # --------------------------------------------------------
+
+    def to_dict(self):
+        return {
+            "hero": {
+                "stack": self.hero.stack,
+                "hole_cards": cards_to_strings(self.hero.hole_cards),
+                "folded": self.hero.folded,
+                "current_bet": self.hero.current_bet,
+            },
+            "bot": {
+                "stack": self.bot.stack,
+                "hole_cards": cards_to_strings(self.bot.hole_cards),
+                "folded": self.bot.folded,
+                "current_bet": self.bot.current_bet,
+            },
+            "deck": cards_to_strings(self.deck.cards),
+            "board": cards_to_strings(self.board),
+            "pot": self.pot,
+            "stage": self.stage,
+            "current_bet": self.current_bet,
+            "game_over": self.game_over,
+            "winner": self.winner,
+            "log": self.log,
+            "bot_simulations": self.bot_simulations,
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        game = cls(seed=None, bot_simulations=data.get("bot_simulations", 2000))
+
+        game.hero.stack = data["hero"]["stack"]
+        game.hero.hole_cards = strings_to_cards(data["hero"]["hole_cards"])
+        game.hero.folded = data["hero"]["folded"]
+        game.hero.current_bet = data["hero"]["current_bet"]
+
+        game.bot.stack = data["bot"]["stack"]
+        game.bot.hole_cards = strings_to_cards(data["bot"]["hole_cards"])
+        game.bot.folded = data["bot"]["folded"]
+        game.bot.current_bet = data["bot"]["current_bet"]
+
+        game.deck.cards = strings_to_cards(data["deck"])
+        game.board = strings_to_cards(data["board"])
+        game.pot = data["pot"]
+        game.stage = data["stage"]
+        game.current_bet = data["current_bet"]
+        game.game_over = data["game_over"]
+        game.winner = data["winner"]
+        game.log = data["log"]
+
+        return game
+
+
+# ============================================================
+# Token helpers
+# ============================================================
+
+def encode_game(game: ApiHoldemGame) -> str:
+    raw = json.dumps(game.to_dict()).encode()
+    return fernet.encrypt(raw).decode()
+
+
+def decode_game(token: str) -> ApiHoldemGame:
+    try:
+        raw = fernet.decrypt(token.encode())
+        data = json.loads(raw.decode())
+        return ApiHoldemGame.from_dict(data)
+    except InvalidToken:
+        raise HTTPException(status_code=400, detail="Invalid game token.")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not decode game state.")
+
+
+# ============================================================
+# Endpoints
+# ============================================================
+
+@app.get("/")
+def root():
+    return {"message": "Poker API is running."}
+
 
 @app.post("/games")
 def create_game():
-    game_id = str(uuid4())
-
     game = ApiHoldemGame(
         seed=random.randint(0, 10**9),
         bot_simulations=2000,
     )
 
-    GAMES[game_id] = game
-
     return {
-        "game_id": game_id,
+        "state_token": encode_game(game),
         "state": game.get_state(),
     }
 
 
-@app.get("/games/{game_id}")
-def get_game(game_id: str):
-    game = GAMES.get(game_id)
-
-    if game is None:
-        raise HTTPException(status_code=404, detail="Game not found.")
-
-    return game.get_state()
-
-
-@app.post("/games/{game_id}/action")
-def submit_action(game_id: str, request: ActionRequest):
-    game = GAMES.get(game_id)
-
-    if game is None:
-        raise HTTPException(status_code=404, detail="Game not found.")
+@app.post("/action")
+def submit_action(request: ActionRequest):
+    game = decode_game(request.state_token)
 
     try:
         game.apply_user_action(request.action, request.amount)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    return game.get_state()
+    return {
+        "state_token": encode_game(game),
+        "state": game.get_state(),
+    }
