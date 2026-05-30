@@ -248,16 +248,3 @@ result = estimate_equity(
 
 print(result)
 ```
-
-## Current Limitations
-
-This is a simplified poker engine and does not yet include every official Texas Hold'em rule.
-
-Current limitations include:
-
-- No blinds
-- No all-in or side-pot support
-- No minimum raise enforcement
-- Bot strategy is simple and based mainly on Monte Carlo equity and pot odds
-- The API stores state on the client side rather than in a database
-- Bot cards may be visible depending on the `SHOW_BOT_CARDS` setting
