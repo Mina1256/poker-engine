@@ -43,7 +43,7 @@ The project is split into two main parts.
 
 ### `holdem_engine.py`
 
-This file contains the core poker logic:
+This file contains the core poker logic and the main reusable game engine:
 
 - `Card` represents a playing card.
 - `Deck` creates, shuffles, and draws from a standard 52-card deck.
@@ -51,18 +51,20 @@ This file contains the core poker logic:
 - `evaluate_five()` ranks exactly five cards.
 - `best_hand_rank()` checks every 5-card combination from 5, 6, or 7 cards and returns the strongest hand.
 - `estimate_equity()` runs Monte Carlo simulations to estimate win, loss, tie, and equity rates.
-- `HoldemGame` provides a command-line version of a simplified poker game.
+- `HoldemGame` provides the main simplified poker engine, including a command-line version of the game.
+- The bot strategy is implemented in the engine using Monte Carlo equity estimates and pot odds.
 
 ### `app.py`
 
-This file wraps the engine in a FastAPI backend.
+This file wraps the poker engine in a FastAPI backend.
 
 It provides:
 
 - A `/games` endpoint to create a new hand
 - An `/action` endpoint to submit player actions
 - A public game state that can be sent to a frontend
-- A simple Monte Carlo bot that chooses actions based on estimated equity and pot odds
+- API-specific state serialization and response formatting
+- A simplified API-facing game wrapper that uses the same poker logic and equity-estimation approach from the engine
 
 ## Installation
 
